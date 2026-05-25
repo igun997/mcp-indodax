@@ -21,8 +21,10 @@ implemented:
     - createVoucher
 
 Environment Variables (see .env):
-    INDODAX_API_KEY    Your API key
-    INDODAX_API_SECRET Your API secret (HMAC-SHA512 signing key)
+    INDODAX_API_KEY       Your Indodax API key
+    INDODAX_API_SECRET    Your Indodax API secret (HMAC-SHA512 signing key)
+    MCP_AUTH_USER         HTTP Basic Auth username (required for HTTP transport)
+    MCP_AUTH_PASSWORD     HTTP Basic Auth password (required for HTTP transport)
 
 Note:  The Indodax private API is available ONLY via HTTPS POST to the single
 endpoint https://indodax.com/tapi.  Authentication is performed by sending
@@ -31,18 +33,29 @@ headers:
     Sign -> HMAC-SHA512 signature of the request body using the secret key.
 
 The FastMCP server makes each private request asynchronously using httpx.
+
+HTTP Basic Auth (for SSE / streamable-HTTP transport only):
+    Set MCP_AUTH_USER and MCP_AUTH_PASSWORD in .env.  Every HTTP request must
+    carry an Authorization: Basic <base64(user:pass)> header.  stdio transport
+    skips auth entirely (local process, no network exposure).
 """
 from __future__ import annotations
 
+import base64
 import hmac
 import hashlib
 import os
+import secrets
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # ---------------------------------------------------------------------------
 # Environment & global initialisation
@@ -59,6 +72,63 @@ if not API_KEY or not API_SECRET:
     )
 
 INDODAX_API_URL = "https://indodax.com/tapi"
+
+MCP_AUTH_USER: str | None = os.getenv("MCP_AUTH_USER")
+MCP_AUTH_PASSWORD: str | None = os.getenv("MCP_AUTH_PASSWORD")
+
+# ---------------------------------------------------------------------------
+# Basic Auth ASGI middleware
+# ---------------------------------------------------------------------------
+
+class BasicAuthMiddleware:
+    """ASGI middleware enforcing HTTP Basic Authentication.
+
+    Skipped automatically when MCP_AUTH_USER / MCP_AUTH_PASSWORD are not set
+    (e.g. stdio transport where no env vars are provided).
+    """
+
+    def __init__(self, app: ASGIApp, username: str, password: str) -> None:
+        self.app = app
+        # Pre-encode expected header value once at startup
+        creds = f"{username}:{password}".encode()
+        self._expected = b"Basic " + base64.b64encode(creds)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            # Pass lifespan and other non-HTTP scopes through unchanged
+            await self.app(scope, receive, send)
+            return
+
+        # Extract Authorization header (case-insensitive scan)
+        headers = dict(scope.get("headers", []))
+        auth_header: bytes = headers.get(b"authorization", b"")
+
+        if secrets.compare_digest(auth_header, self._expected):
+            await self.app(scope, receive, send)
+            return
+
+        # Reject with 401
+        body = b'{"error": "Unauthorized", "message": "Valid Basic Auth credentials required"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", b'Basic realm="MCP Indodax"'),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+def _wrap_with_basic_auth(app: Starlette) -> ASGIApp:
+    """Wrap a Starlette app with BasicAuthMiddleware if credentials are set."""
+    if MCP_AUTH_USER and MCP_AUTH_PASSWORD:
+        return BasicAuthMiddleware(app, MCP_AUTH_USER, MCP_AUTH_PASSWORD)
+    return app
+
 
 mcp = FastMCP("indodax")
 
@@ -326,6 +396,23 @@ async def create_voucher(amount: float, description: str | None = None) -> Dict[
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# HTTP app (used when running with uvicorn)
+# ---------------------------------------------------------------------------
+
+# Expose a top-level `app` variable so uvicorn can find it:
+#   uvicorn server:app --reload
+#
+# Basic Auth is applied when MCP_AUTH_USER + MCP_AUTH_PASSWORD are set.
+# Example:
+#   MCP_AUTH_USER=admin MCP_AUTH_PASSWORD=secret uvicorn server:app
+app: ASGIApp = _wrap_with_basic_auth(mcp.streamable_http_app())
+
+# SSE variant (legacy clients):
+#   uvicorn server:sse_app
+sse_app: ASGIApp = _wrap_with_basic_auth(mcp.sse_app())
+
+
 if __name__ == "__main__":
-    # Run over stdio so that it works nicely with agents expecting MCP transport.
+    # stdio transport: no network exposure → Basic Auth not needed.
     mcp.run(transport="stdio")
